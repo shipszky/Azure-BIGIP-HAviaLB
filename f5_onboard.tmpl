@@ -1,0 +1,226 @@
+#!/bin/bash -x
+# NOTE: Startup Script is run once / initialization only (Cloud-Init behavior vs. typical re-entrant for Azure Custom Script Extension )
+# For 15.1+ and above, Cloud-Init will run the script directly and can remove Azure Custom Script Extension 
+mkdir -p  /var/log/cloud /config/cloud /var/config/rest/downloads
+
+mkdir -p /config/cloud
+
+LOG_FILE=/var/log/cloud/startup-script.log
+[[ ! -f $LOG_FILE ]] && touch $LOG_FILE || { echo "Run Only Once. Exiting"; exit; }
+npipe=/tmp/$$.tmp
+trap "rm -f $npipe" EXIT
+mknod $npipe p
+tee <$npipe -a $LOG_FILE /dev/ttyS0 &
+exec 1>&-
+exec 1>$npipe
+exec 2>&1
+
+# Run Immediately Before MCPD
+/usr/bin/setdb provision.extramb 1024
+/usr/bin/setdb provision.restjavad.extramb 1024
+/usr/bin/setdb iapplxrpm.timeout 300
+/usr/bin/setdb icrd.timeout 180
+/usr/bin/setdb restjavad.timeout 180
+/usr/bin/setdb restnoded.timeout 180
+/usr/bin/setdb config.allow.rfc3927 enable
+
+### write_files:
+# Render BIG-IP Runtime Init Config 
+
+cat << 'EOF' > /config/cloud/runtime-init-conf.yaml
+---
+controls:
+  extensionInstallDelayInMs: 60000
+runtime_parameters:
+  - name: USER_NAME
+    type: static
+    value: ${bigip_username}
+  - name: HOST_NAME
+    type: static
+    value: ${host_name}
+  - name: ADMIN_PASS
+    type: static
+    value: ${bigip_password}
+  - name: SELF_IP_INTERNAL1
+    type: static
+    value: ${self_ip_internal1}
+  - name: SELF_IP_INTERNAL2
+    type: static
+    value: ${self_ip_internal2}
+  - name: SELF_IP_EXTERNAL1
+    type: static
+    value: ${self_ip_external1}
+  - name: SELF_IP_EXTERNAL2
+    type: static
+    value: ${self_ip_external2}
+  - name: DEFAULT_GATEWAY
+    type: static
+    value: ${default_gateway}
+  - name: HA_HOST1
+    type: static
+    value: ${ha_host1}
+  - name: HA_HOST2
+    type: static
+    value: ${ha_host2}
+  - name: MGMT_GW
+    type: metadata
+    metadataProvider:
+      environment: azure
+      type: network
+      field: ipv4
+      index: 0
+      ipcalc: first
+EOF
+
+#cat /config/cloud/runtime-init-conf.yaml > /config/cloud/runtime-init-conf-backup.yaml
+#add DO for runtime init to fire off
+cat << 'EOF' >> /config/cloud/runtime-init-conf.yaml
+extension_packages:
+  install_operations:
+    - extensionType: do
+      extensionVersion: ${DO_VER}
+      extensionUrl: ${DO_URL}
+    - extensionType: as3
+      extensionVersion: ${AS3_VER}
+      extensionUrl: ${AS3_URL}
+    - extensionType: ts
+      extensionVersion: ${TS_VER}
+      extensionUrl: ${TS_URL}
+extension_services:
+  service_operations:
+    - extensionType: do
+      type: inline
+      value:
+        schemaVersion: 1.0.0
+        class: Device
+        async: true
+        Common:
+          class: Tenant
+          hostname: '{{{HOST_NAME}}}.FIXME.com'
+          myNtp:
+            class: NTP
+            servers:
+              - pool.ntp.org
+            timezone: UTC
+          myDns:
+            class: DNS
+            nameServers:
+              - 168.63.129.16
+          myProvisioning:
+            class: Provision
+            ltm: nominal
+            sslo: nominal
+          admin:
+            class: User
+            userType: regular
+            password: '{{{ADMIN_PASS}}}'
+            shell: bash
+            forceInitialPasswordChange: false
+          '{{{USER_NAME}}}':
+            class: User
+            partitionAccess:
+              all-partitions:
+                role: admin
+            password: '{{{ADMIN_PASS}}}'
+            shell: bash
+            userType: regular
+            forceInitialPasswordChange: false
+          two:
+            class: VLAN
+            tag: 4094
+            mtu: 1500
+            interfaces:
+              - name: 1.3
+                tagged: false
+          three:
+            class: VLAN
+            tag: 4093
+            mtu: 1500
+            interfaces:
+              - name: 1.4
+                tagged: false
+          four:
+            class: VLAN
+            tag: 4092
+            mtu: 1500
+            interfaces:
+              - name: 1.1
+                tagged: false
+          five:
+            class: VLAN
+            tag: 4091
+            mtu: 1500
+            interfaces:
+              - name: 1.2
+                tagged: false          
+          internal1-localself:
+            class: SelfIp
+            address: '{{{ SELF_IP_INTERNAL1 }}}/24'
+            vlan: two
+            allowService: default
+            trafficGroup: traffic-group-local-only
+          internal2-localself:
+            class: SelfIp
+            address: '{{{ SELF_IP_INTERNAL2 }}}/24'
+            vlan: three
+            allowService: default
+            trafficGroup: traffic-group-local-only
+          external1-localself:
+            class: SelfIp
+            address: '{{{ SELF_IP_EXTERNAL1 }}}/24'
+            vlan: four
+            allowService: default
+            trafficGroup: traffic-group-local-only
+          external2-localself:
+            class: SelfIp
+            address: '{{{ SELF_IP_EXTERNAL2 }}}/24'
+            vlan: five
+            allowService: default
+            trafficGroup: traffic-group-local-only
+          azureMetadata:
+            class: ManagementRoute
+            gw: "{{{ MGMT_GW }}}"
+            network: 169.254.169.254/32
+          default:
+            class: Route
+            gw: '{{{ DEFAULT_GATEWAY }}}'
+            network: default
+            mtu: 1500
+          configsync:
+            class: ConfigSync
+            configsyncIp: /Common/internal2-localself/address
+          failoverAddress:
+            class: FailoverUnicast
+            address: /Common/internal2-localself/address
+          trust:
+            class: DeviceTrust
+            localUsername: '{{{ USER_NAME }}}'
+            localPassword: '{{{ ADMIN_PASS }}}'
+            remoteHost: /Common/failoverGroup/members/0
+            remoteUsername: '{{{ USER_NAME }}}'
+            remotePassword: '{{{ ADMIN_PASS }}}'
+          failoverGroup:
+            class: DeviceGroup
+            type: sync-failover
+            members:
+              - '{{{ HA_HOST1 }}}'
+              - '{{{ HA_HOST2 }}}'
+            owner: /Common/failoverGroup/members/0
+            autoSync: true
+            saveOnAutoSync: false
+            networkFailover: true
+            fullLoadOnSync: false
+            asmSync: false
+EOF
+
+for i in {1..30}; do
+    curl -fv --retry 1 --connect-timeout 5 -L ${INIT_URL} -o "/var/config/rest/downloads/f5-bigip-runtime-init.gz.run" && break || sleep 10
+done
+export F5_BIGIP_RUNTIME_INIT_LOG_LEVEL=silly
+export F5_BIGIP_RUNTIME_EXTENSION_INSTALL_DELAY_IN_MS=60000
+# Install
+bash /var/config/rest/downloads/f5-bigip-runtime-init.gz.run -- '--cloud azure'
+# Run
+f5-bigip-runtime-init --config-file /config/cloud/runtime-init-conf.yaml
+#sleep 5
+#f5-bigip-runtime-init --config-file /config/cloud/runtime-init-conf-backup.yaml
